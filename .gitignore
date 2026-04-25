@@ -217,3 +217,8 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# Screening run artifacts
+screening_runs/
+screening_runs_smoke/
+.DS_Store

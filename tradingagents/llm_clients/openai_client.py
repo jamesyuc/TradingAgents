@@ -1,10 +1,61 @@
 import os
 from typing import Any, Optional
 
+import httpx
 from langchain_openai import ChatOpenAI
 
 from .base_client import BaseLLMClient, normalize_content
 from .validators import validate_model
+
+
+# AI Builders gateway 500s on the 'x-stainless-raw-response' header that
+# the openai SDK injects via `with_raw_response`. The SDK, however, also
+# relies on this header being present on `response.request.headers` to
+# decide how to parse the response. So we must strip it *only on the wire*,
+# not from the in-memory Request object. A custom transport does exactly
+# that: copy the request, drop the header, send the copy.
+class _StripStainlessRawTransport(httpx.HTTPTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if "x-stainless-raw-response" in request.headers:
+            sanitized = httpx.Request(
+                method=request.method,
+                url=request.url,
+                headers=[(k, v) for k, v in request.headers.raw
+                         if k.lower() != b"x-stainless-raw-response"],
+                content=request.content,
+                extensions=request.extensions,
+            )
+            return super().handle_request(sanitized)
+        return super().handle_request(request)
+
+
+class _AsyncStripStainlessRawTransport(httpx.AsyncHTTPTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if "x-stainless-raw-response" in request.headers:
+            sanitized = httpx.Request(
+                method=request.method,
+                url=request.url,
+                headers=[(k, v) for k, v in request.headers.raw
+                         if k.lower() != b"x-stainless-raw-response"],
+                content=request.content,
+                extensions=request.extensions,
+            )
+            return await super().handle_async_request(sanitized)
+        return await super().handle_async_request(request)
+
+
+def _make_aibuilders_http_client() -> httpx.Client:
+    return httpx.Client(
+        transport=_StripStainlessRawTransport(),
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    )
+
+
+def _make_aibuilders_async_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=_AsyncStripStainlessRawTransport(),
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    )
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -48,6 +99,7 @@ _PROVIDER_CONFIG = {
     "glm": ("https://api.z.ai/api/paas/v4/", "ZHIPU_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
     "ollama": ("http://localhost:11434/v1", None),
+    "aibuilders": ("https://space.ai-builders.com/backend/v1", "AI_BUILDER_TOKEN"),
 }
 
 
@@ -97,6 +149,12 @@ class OpenAIClient(BaseLLMClient):
         # all model families. Third-party providers use Chat Completions.
         if self.provider == "openai":
             llm_kwargs["use_responses_api"] = True
+
+        # AI Builders gateway 500s on the 'x-stainless-raw-response' header
+        # that langchain_openai injects via with_raw_response. Strip it.
+        if self.provider == "aibuilders":
+            llm_kwargs.setdefault("http_client", _make_aibuilders_http_client())
+            llm_kwargs.setdefault("http_async_client", _make_aibuilders_async_http_client())
 
         return NormalizedChatOpenAI(**llm_kwargs)
 

@@ -12,6 +12,39 @@ from .config import get_config
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# Shared browser-impersonating session for yfinance.
+#
+# yfinance 0.2.x supports passing a `session` to Ticker(...) / download(...).
+# Yahoo Finance rate-limits / blocks plain urllib / requests traffic, so we
+# build one curl_cffi session that impersonates Chrome and reuse it across
+# every call. This DRAMATICALLY reduces 429s when screening many tickers.
+# -----------------------------------------------------------------------------
+_YF_SESSION = None
+
+
+def get_yf_session():
+    global _YF_SESSION
+    if _YF_SESSION is not None:
+        return _YF_SESSION
+    try:
+        from curl_cffi import requests as cffi_requests
+        _YF_SESSION = cffi_requests.Session(impersonate="chrome")
+        logger.info("yfinance: using curl_cffi Chrome session")
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(f"curl_cffi session unavailable ({exc}); falling back to default")
+        _YF_SESSION = None
+    return _YF_SESSION
+
+
+def yf_ticker(symbol: str):
+    """Build a yf.Ticker that uses the shared curl_cffi session when available."""
+    sess = get_yf_session()
+    if sess is not None:
+        return yf.Ticker(symbol, session=sess)
+    return yf.Ticker(symbol)
+
+
 def yf_retry(func, max_retries=3, base_delay=2.0):
     """Execute a yfinance call with exponential backoff on rate limits.
 
@@ -69,6 +102,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     if os.path.exists(data_file):
         data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
     else:
+        sess = get_yf_session()
         data = yf_retry(lambda: yf.download(
             symbol,
             start=start_str,
@@ -76,6 +110,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             multi_level_index=False,
             progress=False,
             auto_adjust=True,
+            session=sess,
         ))
         data = data.reset_index()
         data.to_csv(data_file, index=False, encoding="utf-8")
